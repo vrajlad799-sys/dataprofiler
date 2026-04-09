@@ -1,0 +1,4 @@
+duckdb
+pyyaml
+snowflake-connector-python
+databricks-sql-connector
