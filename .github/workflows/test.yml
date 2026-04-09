@@ -1,13 +1,33 @@
-database:
-  type: sqlite
-  path: example.db
+name: Test Profiler
 
-profiling:
-  max_workers: 4
-  sample_rows: 1000
+on: [push]
 
-output:
-  format: json
-  path: output.json
+jobs:
+  test:
+    runs-on: ubuntu-latest
 
-state_path: state.json
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Create test DB
+        run: |
+          python - <<EOF
+          import sqlite3
+          conn = sqlite3.connect("example.db")
+          cur = conn.cursor()
+          cur.execute("CREATE TABLE t (id INT)")
+          cur.execute("INSERT INTO t VALUES (1)")
+          conn.commit()
+          conn.close()
+          EOF
+
+      - name: Run profiler
+        run: python profiler.py --config config.yaml
