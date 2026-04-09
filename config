@@ -1,0 +1,13 @@
+database:
+  type: sqlite
+  path: example.db
+
+profiling:
+  max_workers: 4
+  sample_rows: 1000
+
+output:
+  format: json
+  path: output.json
+
+state_path: state.json
