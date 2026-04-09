@@ -1,0 +1,13 @@
+- type: sqlite
+path: ./test.db
+
+profiling:
+sample_ratio: 0.1
+max_workers: 8
+include_histograms: true
+distinct_method: approx
+max_tables: null
+
+output:
+format: parquet
+path: ./profiles/
