@@ -30,4 +30,4 @@ jobs:
           EOF
 
       - name: Run profiler
-        run: python profiler.py --config config.yaml
+        run: python profiler_sqlite.py --config config.yaml
