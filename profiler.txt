@@ -1,0 +1,361 @@
+"""
+Configurable Multi-Database Data Profiler
+Supports: SQLite, DuckDB, Snowflake, Databricks SQL
+
+Requirements:
+pip install duckdb snowflake-connector-python databricks-sql-connector pyyaml
+
+Usage:
+python profiler.py --config config.yaml
+"""
+
+import json
+import yaml
+import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# =========================
+# Base Connector Interface
+# =========================
+class BaseConnector:
+    def list_tables(self):
+        raise NotImplementedError
+
+    def get_schema(self, table):
+        raise NotImplementedError
+
+    def get_row_count(self, table):
+        raise NotImplementedError
+
+    def profile_column(self, table, column, config):
+        raise NotImplementedError
+
+
+# =========================
+# SQLite Connector
+# =========================
+import sqlite3
+
+class SQLiteConnector(BaseConnector):
+    def __init__(self, path):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.Lock()
+
+    def list_tables(self):
+        cur = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        return [r[0] for r in cur.fetchall()]
+
+    def get_schema(self, table):
+        cur = self.conn.execute(f"PRAGMA table_info({table});")
+        return [
+            {"name": r[1], "type": r[2], "nullable": not r[3], "comment": None}
+            for r in cur.fetchall()
+        ]
+
+    def get_row_count(self, table):
+        cur = self.conn.execute(f"SELECT COUNT(*) FROM {table}")
+        return cur.fetchone()[0]
+
+    def profile_column(self, table, column, config):
+        sample = config.get("sample_rows")
+        query = f"SELECT {column} FROM {table}"
+        if sample:
+            query += f" ORDER BY RANDOM() LIMIT {sample}"
+
+        wrapped = f"""
+        SELECT
+            MIN({column}),
+            MAX({column}),
+            COUNT(DISTINCT {column}),
+            SUM(CASE WHEN {column} IS NULL THEN 1 ELSE 0 END)
+        FROM ({query})
+        """
+        with self.lock:
+            cur = self.conn.execute(wrapped)
+            row = cur.fetchone()
+
+        return {
+            "min": row[0],
+            "max": row[1],
+            "distinct_count": row[2],
+            "null_count": row[3],
+        }
+
+
+# =========================
+# DuckDB Connector
+# =========================
+import duckdb
+
+class DuckDBConnector(BaseConnector):
+    def __init__(self, path=":memory:"):
+        self.conn = duckdb.connect(path)
+
+    def list_tables(self):
+        return [r[0] for r in self.conn.execute("SHOW TABLES").fetchall()]
+
+    def get_schema(self, table):
+        res = self.conn.execute(f"DESCRIBE {table}").fetchall()
+        return [
+            {"name": r[0], "type": r[1], "nullable": True, "comment": None}
+            for r in res
+        ]
+
+    def get_row_count(self, table):
+        return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def profile_column(self, table, column, config):
+        sample_ratio = config.get("sample_ratio")
+        table_expr = table
+        if sample_ratio:
+            table_expr = f"(SELECT * FROM {table} USING SAMPLE {sample_ratio*100} PERCENT)"
+
+        query = f"""
+        SELECT
+            MIN({column}),
+            MAX({column}),
+            APPROX_COUNT_DISTINCT({column}),
+            COUNT(*) - COUNT({column})
+        FROM {table_expr}
+        """
+        row = self.conn.execute(query).fetchone()
+        return {
+            "min": row[0],
+            "max": row[1],
+            "distinct_count": row[2],
+            "null_count": row[3],
+        }
+
+
+# =========================
+# Snowflake Connector
+# =========================
+class SnowflakeConnector(BaseConnector):
+    def __init__(self, cfg):
+        import snowflake.connector
+        self.conn = snowflake.connector.connect(**cfg)
+
+    def list_tables(self):
+        cur = self.conn.cursor()
+        cur.execute("SHOW TABLES")
+        return [r[1] for r in cur.fetchall()]
+
+    def get_schema(self, table):
+        cur = self.conn.cursor()
+        cur.execute(f"DESCRIBE TABLE {table}")
+        return [
+            {"name": r[0], "type": r[1], "nullable": r[3] == "Y", "comment": r[8]}
+            for r in cur.fetchall()
+        ]
+
+    def get_row_count(self, table):
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        return cur.fetchone()[0]
+
+    def profile_column(self, table, column, config):
+        query = f"""
+        SELECT
+            MIN({column}),
+            MAX({column}),
+            APPROX_COUNT_DISTINCT({column}),
+            COUNT(*) - COUNT({column})
+        FROM {table}
+        """
+        cur = self.conn.cursor()
+        cur.execute(query)
+        row = cur.fetchone()
+        return {
+            "min": row[0],
+            "max": row[1],
+            "distinct_count": row[2],
+            "null_count": row[3],
+        }
+
+
+# =========================
+# Databricks Connector
+# =========================
+class DatabricksConnector(BaseConnector):
+    def __init__(self, cfg):
+        from databricks import sql
+        self.conn = sql.connect(**cfg)
+
+    def list_tables(self):
+        cur = self.conn.cursor()
+        cur.execute("SHOW TABLES")
+        return [r[1] for r in cur.fetchall()]
+
+    def get_schema(self, table):
+        cur = self.conn.cursor()
+        cur.execute(f"DESCRIBE {table}")
+        return [
+            {"name": r[0], "type": r[1], "nullable": True, "comment": None}
+            for r in cur.fetchall()
+        ]
+
+    def get_row_count(self, table):
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        return cur.fetchone()[0]
+
+    def profile_column(self, table, column, config):
+        query = f"""
+        SELECT
+            MIN({column}),
+            MAX({column}),
+            approx_count_distinct({column}),
+            COUNT(*) - COUNT({column})
+        FROM {table}
+        """
+        cur = self.conn.cursor()
+        cur.execute(query)
+        row = cur.fetchone()
+        return {
+            "min": row[0],
+            "max": row[1],
+            "distinct_count": row[2],
+            "null_count": row[3],
+        }
+
+
+# =========================
+# Profiler Core
+# =========================
+class Profiler:
+    def __init__(self, connector, config, state=None):
+        self.connector = connector
+        self.config = config
+        self.state = state or {}
+
+    def map_type(self, t):
+        t = t.upper()
+        if "INT" in t:
+            return "integer"
+        if "CHAR" in t or "TEXT" in t or "STRING" in t:
+            return "string"
+        if "FLOAT" in t or "DOUBLE" in t or "REAL" in t:
+            return "float"
+        if "DATE" in t or "TIME" in t:
+            return "datetime"
+        return "unknown"
+
+    def profile_table(self, table):
+        if table in self.state:
+            return self.state[table]
+
+        schema = self.connector.get_schema(table)
+        row_count = self.connector.get_row_count(table)
+
+        columns = []
+        for col in schema:
+            stats = self.connector.profile_column(table, col["name"], self.config)
+            columns.append({
+                "name": col["name"],
+                "physical_type": col["type"],
+                "logical_type": self.map_type(col["type"]),
+                "nullable": col["nullable"],
+                "comment": col.get("comment"),
+                "stats": stats,
+            })
+
+        result = {
+            "table_name": table,
+            "row_count": row_count,
+            "columns": columns,
+        }
+
+        return result
+
+    def run(self):
+        tables = self.connector.list_tables()
+        results = []
+
+        with ThreadPoolExecutor(max_workers=self.config.get("max_workers", 4)) as ex:
+            futures = {ex.submit(self.profile_table, t): t for t in tables}
+
+            for f in as_completed(futures):
+                table = futures[f]
+                res = f.result()
+                results.append(res)
+
+        return results
+
+
+# =========================
+# State Manager (Resilience)
+# =========================
+class StateManager:
+    def __init__(self, path):
+        self.path = path
+        try:
+            with open(path) as f:
+                self.state = json.load(f)
+        except:
+            self.state = {}
+
+    def save(self, table, result):
+        self.state[table] = result
+        with open(self.path, "w") as f:
+            json.dump(self.state, f, indent=2, default=str)
+
+
+# =========================
+# Output Writer
+# =========================
+def write_output(data, path, fmt="json"):
+    if fmt == "json":
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+    elif fmt == "yaml":
+        with open(path, "w") as f:
+            yaml.dump(data, f)
+    else:
+        raise ValueError("Unsupported format")
+
+
+# =========================
+# Connector Factory
+# =========================
+def create_connector(cfg):
+    t = cfg["type"]
+
+    if t == "sqlite":
+        return SQLiteConnector(cfg["path"])
+    elif t == "duckdb":
+        return DuckDBConnector(cfg.get("path", ":memory:"))
+    elif t == "snowflake":
+        return SnowflakeConnector(cfg)
+    elif t == "databricks":
+        return DatabricksConnector(cfg)
+    else:
+        raise ValueError(f"Unsupported DB type: {t}")
+
+
+# =========================
+# Main CLI
+# =========================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    db_cfg = cfg["database"]
+    profiler_cfg = cfg.get("profiling", {})
+    output_cfg = cfg.get("output", {})
+
+    connector = create_connector(db_cfg)
+    state = StateManager(cfg.get("state_path", "state.json"))
+
+    profiler = Profiler(connector, profiler_cfg, state.state)
+    results = profiler.run()
+
+    write_output(results, output_cfg.get("path", "output.json"), output_cfg.get("format", "json"))
+
+
+if __name__ == "__main__":
+    main()
